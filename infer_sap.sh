@@ -3,7 +3,7 @@
 set -eu
 
 infer_conf=conf/infer_sap_common.yaml
-eval_dir=/mnt/matylda4/landini/diarization/EEND/evaluation_sets         # CH1, CH2, DH3 dev, DH3 eval
+eval_dir=/YOUR_EVAL_DIR/evaluation_sets         # CH1, CH2, DH3 dev, DH3 eval
 out_dir=sap    # initial sap output
 
 # Prepare initial speaker activity

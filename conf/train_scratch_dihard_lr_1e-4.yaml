@@ -23,7 +23,7 @@ num_speakers: 2
 num_workers: 4
 optimizer: adam
 lr: 0.0001
-output_path: /mnt/matylda3/ihan/project/diarization/github/diacorrect/exp/train_scratch_dihard_lr_1e-4
+output_path: /YOUR_OUTPUT_DIR/exp/train_scratch_dihard_lr_1e-4
 sampling_rate: 8000
 seed: 3
 subsampling: 10
@@ -32,7 +32,7 @@ train_batchsize: 32
 transformer_encoder_dropout: 0.1
 transformer_encoder_n_heads: 4
 transformer_encoder_n_layers: 4
-train_data_dir: /mnt/matylda4/landini/diarization/EEND/evaluation_sets/DIHARD2020dev.full.cts
-train_sap_dir: /mnt/matylda3/ihan/project/diarization/EEND_dev/sap/DH20ctsfulldev/sap.scp
-valid_data_dir: /mnt/matylda4/landini/diarization/EEND/evaluation_sets/DIHARD2020dev.full.cts
-valid_sap_dir: /mnt/matylda3/ihan/project/diarization/EEND_dev/sap/DH20ctsfulldev/sap.scp
+train_data_dir: /YOUR_EVAL_DIR/DIHARD2020dev.full.cts
+train_sap_dir: /YOUR_SAP_DIR/DH20ctsfulldev/sap.scp
+valid_data_dir: /YOUR_EVAL_DIR/DIHARD2020dev.full.cts
+valid_sap_dir: /YOUR_SAP_DIR/DH20ctsfulldev/sap.scp
