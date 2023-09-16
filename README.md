@@ -13,7 +13,7 @@ This repository provides a PyTorch implementation for DiaCorrect. Only training 
 | Dataset | DER |  MISS | FA | Conf. |
 |:-------|:-----:|:--:|:----:|:--:|
 |CH2 | 7.98 | 4.67 | 2.76 | 0.55 |
-|DH3 | 12.47 | 7.11 | 4.64 | 0.72 |
+|DH3 eval | 12.47 | 7.11 | 4.64 | 0.72 |
 
 # Contact
 jyhan003@gmail.com
