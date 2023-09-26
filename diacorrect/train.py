@@ -5,12 +5,10 @@
 # Licensed under the MIT license.
 
 
-from backend.models_correct import (
+from common_utils.ckpt_utils import (
     average_checkpoints,
     get_model,
     load_checkpoint,
-    pad_labels,
-    pad_sequence,
     save_checkpoint,
 )
 from backend.updater import setup_optimizer, get_rate
@@ -33,16 +31,10 @@ import torch
 import logging
 import yamlargparse
 
-EPS = 1e-8
-def sigmoid_inverse(x):
-    return torch.log((x + EPS) / (1 - x + EPS))
-
-
 def _init_fn(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
 
 def _convert(
     batch: List[Tuple[torch.Tensor, torch.Tensor, str]]
@@ -51,7 +43,6 @@ def _convert(
             'ts': [t for _, t, _, _ in batch],
             'sap': [s for _, _, s, _ in batch],
             'names': [r for _, _, _, r in batch]}
-
 
 def compute_loss_and_metrics(
     model: torch.nn.Module,
@@ -62,27 +53,23 @@ def compute_loss_and_metrics(
     acum_metrics: Dict[str, float],
     vad_loss_weight: float,
     osd_loss_weight: float,
-    detach_attractor_loss: bool
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    y_pred, attractor_loss = model(input, labels, sap, n_speakers, args)
+    y_pred = model(input, sap, sigmoid=False)
     loss, standard_loss = model.get_loss(
-        y_pred, labels, n_speakers, attractor_loss, vad_loss_weight,
-        osd_loss_weight, detach_attractor_loss)
+        y_pred, labels, n_speakers, vad_loss_weight, osd_loss_weight)
     metrics = calculate_metrics(
         labels.detach(), y_pred.detach(), threshold=0.5)
     acum_metrics = update_metrics(acum_metrics, metrics)
     acum_metrics['loss'] += loss.item()
     acum_metrics['loss_standard'] += standard_loss.item()
-    acum_metrics['loss_attractor'] += attractor_loss.item()
     return loss, acum_metrics
-
 
 def get_training_dataloaders(
     args: SimpleNamespace
 ) -> Tuple[DataLoader, DataLoader]:
     train_set = KaldiDiarizationDataset(
         args.train_data_dir,
-        args.train_sap_dir,
+        args.train_sap_scp,
         chunk_size=args.num_frames,
         context_size=args.context_size,
         feature_dim=args.feature_dim,
@@ -91,11 +78,9 @@ def get_training_dataloaders(
         input_transform=args.input_transform,
         n_speakers=args.num_speakers,
         sampling_rate=args.sampling_rate,
-        shuffle=args.time_shuffle,
         subsampling=args.subsampling,
         use_last_samples=args.use_last_samples,
         min_length=args.min_length,
-        use_specaugment=args.use_specaugment,
     )
     train_loader = DataLoader(
         train_set,
@@ -108,7 +93,7 @@ def get_training_dataloaders(
 
     dev_set = KaldiDiarizationDataset(
         args.valid_data_dir,
-        args.valid_sap_dir,
+        args.valid_sap_scp,
         chunk_size=args.num_frames,
         context_size=args.context_size,
         feature_dim=args.feature_dim,
@@ -117,11 +102,9 @@ def get_training_dataloaders(
         input_transform=args.input_transform,
         n_speakers=args.num_speakers,
         sampling_rate=args.sampling_rate,
-        shuffle=args.time_shuffle,
         subsampling=args.subsampling,
         use_last_samples=args.use_last_samples,
         min_length=args.min_length,
-        use_specaugment=False,
     )
     dev_loader = DataLoader(
         dev_set,
@@ -144,16 +127,10 @@ def get_training_dataloaders(
 
     return train_loader, dev_loader
 
-
 def parse_arguments() -> SimpleNamespace:
-    parser = yamlargparse.ArgumentParser(description='EEND training')
+    parser = yamlargparse.ArgumentParser(description='DiaCorrect training')
     parser.add_argument('-c', '--config', help='config file path',
                         action=yamlargparse.ActionConfigFile)
-    parser.add_argument('--conformer-encoder-n-heads', default=4, type=int)
-    parser.add_argument('--conformer-encoder-n-layers', default=4, type=int)
-    parser.add_argument(
-        '--conformer-encoder-dropout', default=0.1, type=float)
-    parser.add_argument('--conformer-kernel-size', default=31, type=int)
     parser.add_argument('--context-size', default=0, type=int)
     parser.add_argument('--dev-batchsize', default=1, type=int,
                         help='number of utterances in one development batch')
@@ -184,9 +161,8 @@ def parse_arguments() -> SimpleNamespace:
     parser.add_argument('--min-length', default=0, type=int,
                         help='Minimum number of frames for the sequences'
                              ' after downsampling.')
-    parser.add_argument('--model-type', default='TransformerEDA',
-                        help='Type of model (for now only TransformerEDA)')
-    parser.add_argument('--noam-warmup-steps', default=100000, type=float)
+    parser.add_argument('--model-type', default='DiaCorrect',
+                        help='Type of model (for now only DiaCorrect)')
     parser.add_argument('--num-frames', default=500, type=int,
                         help='number of frames in one utterance')
     parser.add_argument('--num-speakers', type=int,
@@ -202,37 +178,20 @@ def parse_arguments() -> SimpleNamespace:
                         help='number of utterances in one train batch')
     parser.add_argument('--train-data-dir',
                         help='kaldi-style data dir used for training.')
-    parser.add_argument('--train-sap-dir',
-                        help='sap dir used for training.')
+    parser.add_argument('--train-sap-scp',
+                        help='scp file of sap used for training.')
     parser.add_argument('--transformer-encoder-dropout', type=float)
     parser.add_argument('--transformer-encoder-n-heads', type=int)
     parser.add_argument('--transformer-encoder-n-layers', type=int)
     parser.add_argument('--use-last-samples', default=True, type=bool)
     parser.add_argument('--vad-loss-weight', default=0.0, type=float)
     parser.add_argument('--osd-loss-weight', default=0.0, type=float)
-    parser.add_argument('--use-specaugment', default=False, type=bool)
     parser.add_argument('--valid-data-dir',
                         help='kaldi-style data dir used for validation.')
-    parser.add_argument('--valid-sap-dir',
-                        help='sap dir used for validation.')
-
-    attractor_args = parser.add_argument_group('attractor')
-    attractor_args.add_argument(
-        '--time-shuffle', action='store_true',
-        help='Shuffle time-axis order before input to the network')
-    attractor_args.add_argument(
-        '--attractor-loss-ratio', default=1.0, type=float,
-        help='weighting parameter')
-    attractor_args.add_argument(
-        '--attractor-encoder-dropout', type=float)
-    attractor_args.add_argument(
-        '--attractor-decoder-dropout', type=float)
-    attractor_args.add_argument(
-        '--detach-attractor-loss', type=bool,
-        help='If True, avoid backpropagation on attractor loss')
+    parser.add_argument('--valid-sap-scp',
+                        help='scp file of sap used for validation.')
     args = parser.parse_args()
     return args
-
 
 if __name__ == '__main__':
     args = parse_arguments()
@@ -240,7 +199,7 @@ if __name__ == '__main__':
     # For reproducibility
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
+    # torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
     np.random.seed(args.seed)  # Numpy module.
     random.seed(args.seed)  # Python random module.
     torch.manual_seed(args.seed)
@@ -248,7 +207,7 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     os.environ['PYTHONHASHSEED'] = str(args.seed)
-
+    
     logging.info(args)
 
     writer = SummaryWriter(f"{args.output_path}/tensorboard")
@@ -267,7 +226,7 @@ if __name__ == '__main__':
         model = get_model(args)
         optimizer = setup_optimizer(args, model)
     else:
-        print(f'fine-tune mode...')
+        logging.info(f'fine-tune mode...')
         model = get_model(args)
         model = average_checkpoints(
             args.device, model, args.init_model_path, args.init_epochs)
@@ -291,7 +250,7 @@ if __name__ == '__main__':
         latest = max(paths, key=os.path.getctime)
         epoch, model, optimizer, _ = load_checkpoint(args, latest)
         init_epoch = epoch
-        print(f'load model from epoch {init_epoch}...')
+        logging.info(f'load model from epoch {init_epoch}...')
     else:
         init_epoch = 0
         # Save initial model
@@ -303,8 +262,6 @@ if __name__ == '__main__':
             features = batch['xs']
             labels = batch['ts']
             sap = batch['sap']
-            # remove sigmoid
-            sap = [sigmoid_inverse(s) for s in sap] 
             n_speakers = np.asarray([max(torch.where(t.sum(0) != 0)[0]) + 1
                                      if t.sum() > 0 else 0 for t in labels])
             max_n_speakers = max(n_speakers)
@@ -314,8 +271,7 @@ if __name__ == '__main__':
             sap = torch.stack(sap).to(args.device)
             loss, acum_train_metrics = compute_loss_and_metrics(
                 model, labels, features, sap, n_speakers, acum_train_metrics,
-                args.vad_loss_weight, args.osd_loss_weight,
-                args.detach_attractor_loss)
+                args.vad_loss_weight, args.osd_loss_weight)
             if i % args.log_report_batches_num == \
                     (args.log_report_batches_num-1):
                 for k in acum_train_metrics.keys():
@@ -341,8 +297,6 @@ if __name__ == '__main__':
                 features = batch['xs']
                 labels = batch['ts']
                 sap = batch['sap']
-                # remove sigmoid
-                sap = [sigmoid_inverse(s) for s in sap]
                 n_speakers = np.asarray([max(torch.where(t.sum(0) != 0)[0]) + 1
                                         if t.sum() > 0 else 0 for t in labels])
                 max_n_speakers = max(n_speakers)
@@ -351,8 +305,7 @@ if __name__ == '__main__':
                 sap = torch.stack(sap).to(args.device)
                 _, acum_dev_metrics = compute_loss_and_metrics(
                     model, labels, features, sap, n_speakers, acum_dev_metrics,
-                    args.vad_loss_weight, args.osd_loss_weight,
-                    args.detach_attractor_loss)
+                    args.vad_loss_weight, args.osd_loss_weight)
         for k in acum_dev_metrics.keys():
             writer.add_scalar(
                 f"dev_{k}", acum_dev_metrics[k] / dev_batches_qty,

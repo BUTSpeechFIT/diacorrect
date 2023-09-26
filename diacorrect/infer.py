@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
-# Copyright 2022 Brno University of Technology (author: Federico Landini)
+# Copyright 2022 Brno University of Technology (author: Federico Landini, Jiangyu Han)
 # Licensed under the MIT license.
 
-from backend.models_eend import (
+from common_utils.ckpt_utils import (
     average_checkpoints,
     get_model,
 )
-from common_utils.dataset_eend import KaldiDiarizationDataset
+from common_utils.dataset_correct import KaldiDiarizationDataset
 from common_utils.gpu_utils import use_single_gpu
 from os.path import join
 from pathlib import Path
 from scipy.signal import medfilt
 from torch.utils.data import DataLoader
+from train import _convert
 from types import SimpleNamespace
 from typing import TextIO
 import logging
@@ -23,20 +24,12 @@ import random
 import torch
 import yamlargparse
 
-import h5py
-from typing import Any, Dict, List, Tuple
-
-def _convert(
-    batch: List[Tuple[torch.Tensor, torch.Tensor, str]]
-) -> Dict[str, Any]:
-    return {'xs': [x for x, _, _ in batch],
-            'ts': [t for _, t, _ in batch],
-            'names': [r for _, _, r in batch]}
-
+import torch.nn.functional as F
 
 def get_infer_dataloader(args: SimpleNamespace) -> DataLoader:
     infer_set = KaldiDiarizationDataset(
         args.infer_data_dir,
+        args.infer_sap_scp,
         chunk_size=args.num_frames,
         context_size=args.context_size,
         feature_dim=args.feature_dim,
@@ -45,11 +38,9 @@ def get_infer_dataloader(args: SimpleNamespace) -> DataLoader:
         input_transform=args.input_transform,
         n_speakers=args.num_speakers,
         sampling_rate=args.sampling_rate,
-        shuffle=args.time_shuffle,
         subsampling=args.subsampling,
         use_last_samples=True,
         min_length=0,
-        use_specaugment=False,
     )
     infer_loader = DataLoader(
         infer_set,
@@ -60,13 +51,12 @@ def get_infer_dataloader(args: SimpleNamespace) -> DataLoader:
         worker_init_fn=_init_fn,
     )
 
-    Y, _, _ = infer_set.__getitem__(0)
+    Y, _, _, _ = infer_set.__getitem__(0)
     assert Y.shape[1] == \
         (args.feature_dim * (1 + 2 * args.context_size)), \
         f"Expected feature dimensionality of \
         {args.feature_dim} but {Y.shape[1]} found."
     return infer_loader
-
 
 def hard_labels_to_rttm(
     labels: np.ndarray,
@@ -126,12 +116,10 @@ def hard_labels_to_rttm(
             f"{round((end - ini) * frameshift / 1000, 3)} " +
             f"<NA> <NA> spk{spk} <NA> <NA>\n")
 
-
 def _init_fn(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
 
 def postprocess_output(
     probabilities,
@@ -140,24 +128,21 @@ def postprocess_output(
     median_window_length: int
 ) -> np.ndarray:
     thresholded = probabilities > threshold
+    thresholded = 1.0 * thresholded
     filtered = np.zeros(thresholded.shape)
     for spk in range(filtered.shape[1]):
         filtered[:, spk] = medfilt(
             thresholded[:, spk],
             kernel_size=median_window_length)
+        # filtered[:, spk] = thresholded[:, spk]
+
     probs_extended = np.repeat(filtered, subsampling, axis=0)
     return probs_extended
 
-
 def parse_arguments() -> SimpleNamespace:
-    parser = yamlargparse.ArgumentParser(description='EEND inference')
+    parser = yamlargparse.ArgumentParser(description='DiaCorrect inference')
     parser.add_argument('-c', '--config', help='config file path',
                         action=yamlargparse.ActionConfigFile)
-    parser.add_argument('--conformer-encoder-n-heads', default=4, type=int)
-    parser.add_argument('--conformer-encoder-n-layers', default=4, type=int)
-    parser.add_argument(
-        '--conformer-encoder-dropout', default=0.1, type=float)
-    parser.add_argument('--conformer-kernel-size', default=31, type=int)
     parser.add_argument('--context-size', default=0, type=int)
     parser.add_argument('--encoder-units', type=int,
                         help='number of units in the encoder')
@@ -172,21 +157,23 @@ def parse_arguments() -> SimpleNamespace:
     parser.add_argument('--hidden-size', type=int,
                         help='number of units in SA blocks')
     parser.add_argument('--infer-data-dir', help='inference data directory.')
+    parser.add_argument('--infer-sap-scp', help='inference sap scp.')
     parser.add_argument('--input-transform', default='',
                         choices=['logmel', 'logmel_meannorm',
                                  'logmel_meanvarnorm'],
                         help='input normalization transform')
     parser.add_argument('--log-report-batches-num', default=1, type=float)
     parser.add_argument('--median-window-length', default=11, type=int)
-    parser.add_argument('--model-type', default='TransformerEDA',
-                        help='Type of model (for now only TransformerEDA)')
+    parser.add_argument('--model-type', default='DiaCorrect',
+                        help='Type of model (for now only DiaCorrect)')
     parser.add_argument('--models-path', type=str,
                         help='directory with model(s) to evaluate')
     parser.add_argument('--num-frames', default=-1, type=int,
                         help='number of frames in one utterance')
     parser.add_argument('--num-speakers', type=int)
-    parser.add_argument('--out-dir', type=str,
-                        help='output directory for SAP.')
+    parser.add_argument('--rttms-dir', type=str,
+                        help='output directory for rttm files.')
+    parser.add_argument('--bias', default=0.0, type=float, help='calibration bias')
     parser.add_argument('--sampling-rate', type=int)
     parser.add_argument('--seed', type=int)
     parser.add_argument('--subsampling', default=10, type=int)
@@ -196,23 +183,6 @@ def parse_arguments() -> SimpleNamespace:
     parser.add_argument('--transformer-encoder-dropout', type=float)
     parser.add_argument('--vad-loss-weight', default=0.0, type=float)
     parser.add_argument('--osd-loss-weight', default=0.0, type=float)
-
-    attractor_args = parser.add_argument_group('attractor')
-    attractor_args.add_argument(
-        '--time-shuffle', action='store_true',
-        help='Shuffle time-axis order before input to the network')
-    attractor_args.add_argument('--attractor-loss-ratio', default=1.0,
-                                type=float, help='weighting parameter')
-    attractor_args.add_argument('--attractor-encoder-dropout',
-                                default=0.1, type=float)
-    attractor_args.add_argument('--attractor-decoder-dropout',
-                                default=0.1, type=float)
-    attractor_args.add_argument('--estimate-spk-qty', default=-1, type=int)
-    attractor_args.add_argument('--estimate-spk-qty-thr',
-                                default=-1, type=float)
-    attractor_args.add_argument(
-        '--detach-attractor-loss', default=False, type=bool,
-        help='If True, avoid backpropagation on attractor loss')
     args = parser.parse_args()
     return args
 
@@ -223,7 +193,7 @@ if __name__ == '__main__':
     # For reproducibility
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
+    # torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
     np.random.seed(args.seed)  # Numpy module.
     random.seed(args.seed)  # Python random module.
     torch.manual_seed(args.seed)
@@ -248,15 +218,29 @@ if __name__ == '__main__':
         args.device, model, args.models_path, args.epochs)
     model.eval()
 
-    out_dir = args.out_dir
+    out_dir = join(
+        args.rttms_dir,
+        f"epochs{args.epochs}",
+        f"detection_thr{args.threshold}",
+        f"median{args.median_window_length}",
+        "rttms"
+    )
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     for i, batch in enumerate(infer_loader):
         input = torch.stack(batch['xs']).to(args.device)
+        sap = torch.stack(batch['sap']).to(args.device)
+        # calibration
+        sap = sap + args.bias
+
         name = batch['names'][0]
         with torch.no_grad():
-            y_pred = model.estimate_sequential(input, args)[0]
-            print(f'name: {name} | {y_pred.shape}')
-        outdata = y_pred.cpu().detach().numpy()
-        rttm_filename = join(out_dir, f"{name}.h5")
-        with h5py.File(rttm_filename, 'w') as wf:
-            wf.create_dataset('T_hat', data=outdata)
+            y_pred = model(input, sap, sigmoid=True)[0]
+            print(f'i={i+1} | name: {name} | {y_pred.shape}')
+        y_pred = y_pred.cpu().detach().numpy()
+        post_y = postprocess_output(
+            y_pred, args.subsampling,
+            args.threshold, args.median_window_length)
+        rttm_filename = join(out_dir, f"{name}.rttm")
+        with open(rttm_filename, 'w') as rttm_file:
+            hard_labels_to_rttm(post_y, name, rttm_file)

@@ -79,61 +79,6 @@ def get_labeledSTFT(
         return Y, T
 
 
-# author: Ladislav Mošner
-def spec_augment_time_mapped(
-          x, T=30, num_masks=1, replace_with_zeros=True, p=0.2):
-    """
-    x: (time, freq)
-    """
-    n_frames = x.shape[0]
-    n_bins = x.shape[-1]
-    mask = np.zeros(x.shape, dtype=np.bool_)
-    for mask_idx in range(num_masks):
-        mask_range = int(round(np.random.uniform(low=0, high=T)))
-        if mask_range > p*n_frames:
-            mask_range = 0
-        mask_start = int(round(np.random.uniform(
-                               low=0, high=(n_frames-mask_range))))
-        mask_end = mask_start+mask_range
-        new_mask = np.concatenate((
-                np.zeros((mask_start, n_bins), dtype=np.bool_),
-                np.ones((mask_range, n_bins), dtype=np.bool_),
-                np.zeros((n_frames-mask_end, n_bins))), axis=0)
-        mask = np.logical_or(mask, new_mask)
-    if replace_with_zeros:
-        replacement = 0
-    else:
-        replacement = np.mean(x)
-    np.putmask(x, mask, replacement)
-    return x
-
-
-# author: Ladislav Mošner
-def spec_augment_freq_mapped(x, F=50, num_masks=1, replace_with_zeros=True):
-    """
-    x: (time, freq)
-    """
-    n_frames = x.shape[0]
-    n_bins = x.shape[-1]
-    mask = np.zeros(x.shape, dtype=np.bool_)
-    for mask_idx in range(num_masks):
-        mask_range = int(round(np.random.uniform(low=0, high=F)))
-        mask_start = int(round(np.random.uniform(
-                                 low=0, high=(n_bins-mask_range))))
-        mask_end = mask_start+mask_range
-        new_mask = np.concatenate((
-                np.zeros((n_frames, mask_start), dtype=np.bool_),
-                np.ones((n_frames, mask_range), dtype=np.bool_),
-                np.zeros((n_frames, n_bins-mask_end), dtype=np.bool_)), axis=-1)
-        mask = np.logical_or(mask, new_mask)
-    if replace_with_zeros:
-        replacement = 0
-    else:
-        replacement = np.mean(x)
-    np.putmask(x, mask, replacement)
-    return x
-
-
 def splice(Y: np.ndarray, context_size: int = 0) -> np.ndarray:
     """ Frame splicing
     Args:

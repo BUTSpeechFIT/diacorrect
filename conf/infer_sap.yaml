@@ -11,7 +11,7 @@ gpu: 1
 hidden_size: 256
 input_transform: logmel_meannorm
 model_type: TransformerEDA
-models_path: /YOUR_INITIAL_MODEL/models/
+models_path: 
 num_frames: -1
 num_speakers: 2
 sampling_rate: 8000

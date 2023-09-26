@@ -1,8 +1,6 @@
 # training options
 context_size: 7
 encoder_units: 2048
-estimate_spk_qty: 2
-estimate_spk_qty_thr: -1
 feature_dim: 23
 frame_shift: 80
 frame_size: 200
@@ -15,7 +13,6 @@ num_speakers: 2
 sampling_rate: 8000
 seed: 3
 subsampling: 10
-time_shuffle: True
 threshold: 0.5
 transformer_encoder_dropout: 0.1
 transformer_encoder_n_heads: 4

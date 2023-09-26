@@ -4,41 +4,22 @@
 # Copyright 2022 Brno University of Technology (author: Federico Landini)
 # Licensed under the MIT license.
 
-# To deal with git submodule not being a python package
-import sys
-from os.path import abspath, dirname, isfile, join
-sys.path.append(join(dirname(abspath(__file__)), "conformer"))
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import numpy as np
+from typing import List, Tuple
+from types import SimpleNamespace
 
 from backend.losses import (
-    batch_pit_n_speaker_loss,
     pit_loss_multispk,
     osd_loss,
     vad_loss,
 )
-from backend.updater import (
-    NoamOpt,
-    setup_optimizer,
-)
-from pathlib import Path
-from torch.nn import Module, ModuleList
-from types import SimpleNamespace
-from typing import Dict, List, Tuple
-import copy
-import numpy as np
-import torch
-import torch.nn.functional as F
-import torch.optim as optim
-import logging
+from common_utils.pad_utils import pad_labels
 
-"""
-T: number of frames
-C: number of speakers (classes)
-D: dimension of embedding (for deep clustering loss)
-B: mini-batch size
-"""
-
-
-class EncoderDecoderAttractor(Module):
+class EncoderDecoderAttractor(nn.Module):
     def __init__(
         self,
         device: torch.device,
@@ -141,8 +122,7 @@ class EncoderDecoderAttractor(Module):
         attractors = attractors[:, :-1, :]
         return loss, attractors
 
-
-class MultiHeadSelfAttention(Module):
+class MultiHeadSelfAttention(nn.Module):
     """ Multi head self-attention layer
     """
     def __init__(
@@ -177,8 +157,7 @@ class MultiHeadSelfAttention(Module):
         x = x.permute(0, 2, 1, 3).reshape(-1, self.h * self.d_k)
         return self.linearO(x)
 
-
-class PositionwiseFeedForward(Module):
+class PositionwiseFeedForward(nn.Module):
     """ Positionwise feed-forward layer
     """
     def __init__(
@@ -197,8 +176,7 @@ class PositionwiseFeedForward(Module):
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear2(F.dropout(F.relu(self.linear1(x)), self.dropout))
 
-
-class TransformerEncoder(Module):
+class TransformerEncoder(nn.Module):
     def __init__(
         self,
         device: torch.device,
@@ -261,8 +239,7 @@ class TransformerEncoder(Module):
         # output: (BT, F)
         return self.lnorm_out(e)
 
-
-class TransformerEDADiarization(Module):
+class TransformerEDADiarization(nn.Module):
 
     def __init__(
         self,
@@ -310,7 +287,6 @@ class TransformerEDADiarization(Module):
         self.osd_loss_weight = osd_loss_weight
 
     def get_embeddings(self, xs: torch.Tensor) -> torch.Tensor:
-        ilens = [x.shape[0] for x in xs]
         # xs: (B, T, F)
         pad_shape = xs.shape
         # emb: (B*T, E)
@@ -401,156 +377,3 @@ class TransformerEDADiarization(Module):
         return loss + vad_loss_value * vad_loss_weight + \
             osd_loss_value * osd_loss_weight + \
             attractor_loss * self.attractor_loss_ratio, loss
-
-
-def pad_labels(ts: torch.Tensor, out_size: int) -> torch.Tensor:
-    # pad label's speaker-dim to be model's n_speakers
-    ts_padded = []
-    for _, t in enumerate(ts):
-        if t.shape[1] < out_size:
-            # padding
-            ts_padded.append(torch.cat((t, -1 * torch.ones((
-                t.shape[0], out_size - t.shape[1]))), dim=1))
-        elif t.shape[1] > out_size:
-            # truncate
-            ts_padded.append(t[:, :out_size].float())
-        else:
-            ts_padded.append(t.float())
-    return ts_padded
-
-
-def pad_sequence(
-    features: List[torch.Tensor],
-    labels: List[torch.Tensor],
-    seq_len: int
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    features_padded = []
-    labels_padded = []
-    assert len(features) == len(labels), (
-        f"Features and labels in batch were expected to match but got "
-        "{len(features)} features and {len(labels)} labels.")
-    for i, _ in enumerate(features):
-        assert features[i].shape[0] == labels[i].shape[0], (
-            f"Length of features and labels were expected to match but got "
-            "{features[i].shape[0]} and {labels[i].shape[0]}")
-        length = features[i].shape[0]
-        if length < seq_len:
-            extend = seq_len - length
-            features_padded.append(torch.cat((features[i], -torch.ones((
-                extend, features[i].shape[1]))), dim=0))
-            labels_padded.append(torch.cat((labels[i], -torch.ones((
-                extend, labels[i].shape[1]))), dim=0))
-        elif length > seq_len:
-            raise (f"Sequence of length {length} was received but only "
-                   "{seq_len} was expected.")
-        else:
-            features_padded.append(features[i])
-            labels_padded.append(labels[i])
-    return features_padded, labels_padded
-
-
-def save_checkpoint(
-    args,
-    epoch: int,
-    model: Module,
-    optimizer: NoamOpt,
-    loss: torch.Tensor
-) -> None:
-    Path(f"{args.output_path}/models").mkdir(parents=True, exist_ok=True)
-
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss},
-        f"{args.output_path}/models/checkpoint_{epoch}.tar"
-    )
-
-
-def load_checkpoint(args: SimpleNamespace, filename: str):
-    model = get_model(args)
-    optimizer = setup_optimizer(args, model)
-
-    assert isfile(filename), \
-        f"File {filename} does not exist."
-    checkpoint = torch.load(filename)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
-    return epoch, model, optimizer, loss
-
-
-def load_initmodel(args: SimpleNamespace):
-    return load_checkpoint(args, args.initmodel)
-
-
-def get_model(args: SimpleNamespace) -> Module:
-    if args.model_type == 'TransformerEDA':
-        model = TransformerEDADiarization(
-            device=args.device,
-            in_size=args.feature_dim * (1 + 2 * args.context_size),
-            n_units=args.hidden_size,
-            e_units=args.encoder_units,
-            n_heads=args.transformer_encoder_n_heads,
-            n_layers=args.transformer_encoder_n_layers,
-            dropout=args.transformer_encoder_dropout,
-            attractor_loss_ratio=args.attractor_loss_ratio,
-            attractor_encoder_dropout=args.attractor_encoder_dropout,
-            attractor_decoder_dropout=args.attractor_decoder_dropout,
-            detach_attractor_loss=args.detach_attractor_loss,
-            vad_loss_weight=args.vad_loss_weight,
-            osd_loss_weight=args.osd_loss_weight,
-        )
-    else:
-        raise ValueError('Possible model_type should be "TransformerEDA"')
-    return model
-
-
-def average_checkpoints(
-    device: torch.device,
-    model: Module,
-    models_path: str,
-    epochs: str
-) -> Module:
-    epochs = parse_epochs(epochs)
-    states_dict_list = []
-    for e in epochs:
-        copy_model = copy.deepcopy(model)
-        checkpoint = torch.load(join(
-            models_path,
-            f"checkpoint_{e}.tar"), map_location=device)
-        copy_model.load_state_dict(checkpoint['model_state_dict'])
-        states_dict_list.append(copy_model.state_dict())
-    avg_state_dict = average_states(states_dict_list, device)
-    avg_model = copy.deepcopy(model)
-    avg_model.load_state_dict(avg_state_dict)
-    return avg_model
-
-
-def average_states(
-    states_list: List[Dict[str, torch.Tensor]],
-    device: torch.device,
-) -> List[Dict[str, torch.Tensor]]:
-    qty = len(states_list)
-    avg_state = states_list[0]
-    for i in range(1, qty):
-        for key in avg_state:
-            # avg_state[key] += states_list[i][key].to(device)
-            avg_state[key] = avg_state[key].to(device) + states_list[i][key].to(device)
-
-    for key in avg_state:
-        avg_state[key] = avg_state[key] / qty
-    return avg_state
-
-
-def parse_epochs(string: str) -> List[int]:
-    parts = string.split(',')
-    res = []
-    for p in parts:
-        if '-' in p:
-            interval = p.split('-')
-            res.extend(range(int(interval[0])+1, int(interval[1])+1))
-        else:
-            res.append(int(p))
-    return res

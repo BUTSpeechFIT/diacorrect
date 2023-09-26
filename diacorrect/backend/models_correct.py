@@ -4,45 +4,27 @@
 # Copyright 2023 Brno University of Technology (author: Jiangyu Han, Federico Landini)
 # Licensed under the MIT license.
 
-# To deal with git submodule not being a python package
-import sys
-from os.path import abspath, dirname, isfile, join
-sys.path.append(join(dirname(abspath(__file__)), "conformer"))
+"""
+The reference of SAPEncoder:
+https://github.com/funcwj/conv-tasnet/blob/master/nnet/conv_tas_net.py
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import numpy as np
+from typing import List, Tuple
 
 from backend.losses import (
-    batch_pit_n_speaker_loss,
     pit_loss_multispk,
     osd_loss,
     vad_loss,
 )
-from backend.updater import (
-    NoamOpt,
-    setup_optimizer,
-)
-
-from pathlib import Path
-from torch.nn import Module, ModuleList
-from types import SimpleNamespace
-from typing import Dict, List, Tuple
-import copy
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import logging
-
-
-"""
-T: number of frames
-C: number of speakers (classes)
-D: dimension of embedding (for deep clustering loss)
-B: mini-batch size
-"""
+from common_utils.pad_utils import pad_labels
 
 class Conv2dEncoder(nn.Module):
     def __init__(self, idim, odim):
-        """Construct an Conv2dEncoder object."""
         super(Conv2dEncoder, self).__init__()
         self.conv = torch.nn.Sequential(
             nn.Conv2d(1, odim, (3, 7), (1, 5), (1, 0)),
@@ -58,10 +40,10 @@ class Conv2dEncoder(nn.Module):
         Args:
             x (torch.Tensor): Input tensor (#batch, time, idim).
         """
-        x = x.unsqueeze(1)  # (b, c, t, f)
+        x = x.unsqueeze(1)  
         x = self.conv(x)
-        b, c, t, f = x.size()
-        x = self.out(x.transpose(1, 2).contiguous().view(b, t, c * f))
+        b, c, t, n = x.size()
+        x = self.out(x.transpose(1, 2).contiguous().view(b, t, c * n))
         return x  
     
 class ChannelWiseLayerNorm(nn.LayerNorm):
@@ -74,16 +56,17 @@ class ChannelWiseLayerNorm(nn.LayerNorm):
 
     def forward(self, x):
         """
-        x: N x C x T
+        Args:
+            x (torch.Tensor): Input tensor (#batch, idim, time).
         """
         if x.dim() != 3:
             raise RuntimeError("{} accept 3D tensor as input".format(
                 self.__name__))
-        # N x C x T => N x T x C
+        # B x N x T => B x T x N
         x = torch.transpose(x, 1, 2)
         # LN
         x = super().forward(x)
-        # N x C x T => N x T x C
+        # B x N x T => B x T x N
         x = torch.transpose(x, 1, 2)
         return x
 
@@ -150,8 +133,7 @@ class SAPEncoder(nn.Module):
         x = self.conv1d_block(x)     
         return torch.einsum('ijk->ikj', x)  
 
-
-class MultiHeadSelfAttention(Module):
+class MultiHeadSelfAttention(nn.Module):
     """ Multi head self-attention layer
     """
     def __init__(
@@ -186,8 +168,7 @@ class MultiHeadSelfAttention(Module):
         x = x.permute(0, 2, 1, 3).reshape(-1, self.h * self.d_k)
         return self.linearO(x)
 
-
-class PositionwiseFeedForward(Module):
+class PositionwiseFeedForward(nn.Module):
     """ Positionwise feed-forward layer
     """
     def __init__(
@@ -206,8 +187,7 @@ class PositionwiseFeedForward(Module):
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear2(F.dropout(F.relu(self.linear1(x)), self.dropout))
 
-
-class TransformerEncoder(Module):
+class TransformerEncoder(nn.Module):
     def __init__(
         self,
         device: torch.device,
@@ -270,9 +250,7 @@ class TransformerEncoder(Module):
         # output: (BT, F)
         return self.lnorm_out(e)
 
-
-class DiaCorrect(Module):
-
+class DiaCorrect(nn.Module):
     def __init__(
         self,
         device: torch.device,
@@ -284,24 +262,19 @@ class DiaCorrect(Module):
         dropout: float = 0.1,
         vad_loss_weight: float = 0.0,
         osd_loss_weight: float = 0.0,
-        attractor_loss_ratio: float = 1.0,
-        attractor_encoder_dropout: float = 0.1,
-        attractor_decoder_dropout: float = 0.1,
-        detach_attractor_loss: bool = False,
         n_speakers: int = 2
     ) -> None:
-        """ Self-attention-based diarization model.
+        """ Self-attention-based DiaCorrect model.
         Args:
           in_size (int): Dimension of input feature vector
           n_units (int): Number of units in a self-attention block
+          e_units (int): Number of units in FeedForwardLayer
           n_heads (int): Number of attention heads
           n_layers (int): Number of transformer-encoder layers
           dropout (float): dropout ratio
           vad_loss_weight (float) : weight for vad_loss
           osd_loss_weight (float) : weight for osd_loss
-          attractor_loss_ratio (float)
-          attractor_encoder_dropout (float)
-          attractor_decoder_dropout (float)
+          n_speakers (int): Number of speakers, default 2
         """
         self.device = device
         super(DiaCorrect, self).__init__()
@@ -310,36 +283,15 @@ class DiaCorrect(Module):
         self.transformer_dec = TransformerEncoder(
             self.device, n_units*3, n_layers, n_units, e_units, n_heads, dropout
         )
-        self.decoder = nn.Linear(n_units, n_speakers).to(self.device)
-        self.attractor_loss_ratio = attractor_loss_ratio
+        self.linear_dec = nn.Linear(n_units, n_speakers).to(self.device)
         self.vad_loss_weight = vad_loss_weight
         self.osd_loss_weight = osd_loss_weight
-    
-
-    def estimate_sequential(
-        self,
-        xs: torch.Tensor,
-        sap: torch.Tensor,
-        args: SimpleNamespace
-    ) -> List[torch.Tensor]:
-        batch_size, time_len, _ = xs.shape
-        speech_emb = self.speech_enc(xs)
-        spk_num = sap.shape[-1]
-        sap_emb = torch.cat([self.sap_enc(torch.unsqueeze(sap[:, :, c], -1)) 
-                                                for c in range(spk_num)], -1)
-        ys = self.transformer_dec(torch.cat([speech_emb, sap_emb], -1))
-        ys = ys.reshape(batch_size, time_len, -1)
-        ys = self.decoder(ys)
-        ys = [torch.sigmoid(y) for y in ys]
-        return ys
 
     def forward(
         self,
         xs: torch.Tensor,
-        ts: torch.Tensor,
         sap: torch.Tensor,
-        n_speakers: List[int],
-        args: SimpleNamespace
+        sigmoid: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, time_len, _ = xs.shape
         speech_emb = self.speech_enc(xs)
@@ -348,18 +300,18 @@ class DiaCorrect(Module):
                                                 for c in range(spk_num)], -1)
         ys = self.transformer_dec(torch.cat([speech_emb, sap_emb], -1))
         ys = ys.reshape(batch_size, time_len, -1)
-        ys = self.decoder(ys)
-        return ys, torch.tensor(0.0).to(xs.device)
+        ys = self.linear_dec(ys)
+        if sigmoid:
+            ys = [torch.sigmoid(y) for y in ys]
+        return ys
 
     def get_loss(
         self,
         ys: torch.Tensor,
         target: torch.Tensor,
         n_speakers: List[int],
-        attractor_loss: torch.Tensor,
         vad_loss_weight: float,
         osd_loss_weight: float,
-        detach_attractor_loss: bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_n_speakers = max(n_speakers)
         ts_padded = pad_labels(target, max_n_speakers)
@@ -368,182 +320,19 @@ class DiaCorrect(Module):
         ys_padded = torch.stack(ys_padded)
 
         loss = pit_loss_multispk(
-            ys_padded, ts_padded, n_speakers, detach_attractor_loss)
+            ys_padded, ts_padded, n_speakers, detach_attractor_loss=False)
         vad_loss_value = vad_loss(ys, target)
         osd_loss_value = osd_loss(ys, target)
 
         return loss + vad_loss_value * vad_loss_weight + \
-            osd_loss_value * osd_loss_weight + \
-            attractor_loss * self.attractor_loss_ratio, loss
+            osd_loss_value * osd_loss_weight, loss
 
-
-def pad_labels(ts: torch.Tensor, out_size: int) -> torch.Tensor:
-    # pad label's speaker-dim to be model's n_speakers
-    ts_padded = []
-    for _, t in enumerate(ts):
-        if t.shape[1] < out_size:
-            # padding
-            ts_padded.append(torch.cat((t, -1 * torch.ones((
-                t.shape[0], out_size - t.shape[1]))), dim=1))
-        elif t.shape[1] > out_size:
-            # truncate
-            ts_padded.append(t[:, :out_size].float())
-        else:
-            ts_padded.append(t.float())
-    return ts_padded
-
-
-def pad_sequence(
-    features: List[torch.Tensor],
-    labels: List[torch.Tensor],
-    sap: List[torch.Tensor],
-    seq_len: int
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    features_padded = []
-    labels_padded = []
-    sap_padded = []
-    assert len(features) == len(labels) == len(sap), (
-        f"Features and labels in batch were expected to match but got "
-        "{len(features)} features and {len(labels)} labels.")
-    for i, _ in enumerate(features):
-        assert features[i].shape[0] == labels[i].shape[0] == sap[i].shape[0], (
-            f"Length of features and labels sap were expected to match but got "
-            "{features[i].shape[0]} and {labels[i].shape[0]} and {sap[i].shape[0]}")
-        length = features[i].shape[0]
-        if length < seq_len:
-            extend = seq_len - length
-            features_padded.append(torch.cat((features[i], -torch.ones((
-                extend, features[i].shape[1]))), dim=0))
-            labels_padded.append(torch.cat((labels[i], -torch.ones((
-                extend, labels[i].shape[1]))), dim=0))
-            sap_padded.append(torch.cat((sap[i], -torch.ones((
-                extend, sap[i].shape[1]))), dim=0))
-        elif length > seq_len:
-            raise (f"Sequence of length {length} was received but only "
-                   "{seq_len} was expected.")
-        else:
-            features_padded.append(features[i])
-            labels_padded.append(labels[i])
-            sap_padded.append(sap[i])
-    return features_padded, labels_padded, sap_padded
-
-
-def save_checkpoint(
-    args,
-    epoch: int,
-    model: Module,
-    optimizer: NoamOpt,
-    loss: torch.Tensor
-) -> None:
-    Path(f"{args.output_path}/models").mkdir(parents=True, exist_ok=True)
-
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.module.state_dict() if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss},
-        f"{args.output_path}/models/checkpoint_{epoch}.tar"
-    )
-
-
-def load_checkpoint(args: SimpleNamespace, filename: str):
-    model = get_model(args)
-    optimizer = setup_optimizer(args, model)
-
-    assert isfile(filename), \
-        f"File {filename} does not exist."
-    checkpoint = torch.load(filename)
-    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        model.module.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
-    return epoch, model, optimizer, loss
-
-
-def load_initmodel(args: SimpleNamespace):
-    return load_checkpoint(args, args.initmodel)
-
-
-def get_model(args: SimpleNamespace) -> Module:
-    if args.model_type == 'DiaCorrect':
-        model = DiaCorrect(
-            device=args.device,
-            in_size=args.feature_dim * (1 + 2 * args.context_size),
-            n_units=args.hidden_size,
-            e_units=args.encoder_units,
-            n_heads=args.transformer_encoder_n_heads,
-            n_layers=args.transformer_encoder_n_layers,
-            dropout=args.transformer_encoder_dropout,
-            attractor_loss_ratio=args.attractor_loss_ratio,
-            attractor_encoder_dropout=args.attractor_encoder_dropout,
-            attractor_decoder_dropout=args.attractor_decoder_dropout,
-            detach_attractor_loss=args.detach_attractor_loss,
-            vad_loss_weight=args.vad_loss_weight,
-            osd_loss_weight=args.osd_loss_weight,
-        )
-    else:
-        raise ValueError('Possible model_type are "TransformerEDA" or "ConformerEDA"')
-    return model
-
-
-def average_checkpoints(
-    device: torch.device,
-    model: Module,
-    models_path: str,
-    epochs: str
-) -> Module:
-    epochs = parse_epochs(epochs)
-    states_dict_list = []
-    for e in epochs:
-        copy_model = copy.deepcopy(model)
-        checkpoint = torch.load(join(
-            models_path,
-            f"checkpoint_{e}.tar"), map_location=device)
-        copy_model.load_state_dict(checkpoint['model_state_dict'])
-        states_dict_list.append(copy_model.state_dict())
-    avg_state_dict = average_states(states_dict_list, device)
-    avg_model = copy.deepcopy(model)
-    avg_model.load_state_dict(avg_state_dict)
-    return avg_model
-
-
-def average_states(
-    states_list: List[Dict[str, torch.Tensor]],
-    device: torch.device,
-) -> List[Dict[str, torch.Tensor]]:
-    qty = len(states_list)
-    avg_state = states_list[0]
-    for i in range(1, qty):
-        for key in avg_state:
-            # avg_state[key] += states_list[i][key].to(device)
-            avg_state[key] = avg_state[key].to(device) + states_list[i][key].to(device)
-
-    for key in avg_state:
-        avg_state[key] = avg_state[key] / qty
-    return avg_state
-
-
-def parse_epochs(string: str) -> List[int]:
-    parts = string.split(',')
-    res = []
-    for p in parts:
-        if '-' in p:
-            interval = p.split('-')
-            res.extend(range(int(interval[0])+1, int(interval[1])+1))
-        else:
-            res.append(int(p))
-    return res
 
 if __name__ == '__main__':
     model = DiaCorrect(torch.device('cpu'))
     xs = torch.randn(1, 500, 345)
     sap = torch.randn(1, 500, 2)
     ts = torch.randn(1, 500, 2)
-    ys = model(xs, ts, sap, None, None)
-    print(ys[0].shape)
-    ys = model.estimate_sequential(xs, sap, None)
+    ys = model(xs, ts, sap)
     print(ys[0].shape)
         
